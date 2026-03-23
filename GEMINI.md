@@ -11,4 +11,4 @@
 2. 每步完成后告知用户处理了多少条
 3. 任一工具返回错误超过 3 次则停止并告知用户具体原因
 
-**项目路径**：c:/Users/p/Documents/code/personal_auto_ai_Double_entry_bookkeeping
+如果用户明确要求要执行哪一步，则仅执行该步，不要按顺序执行

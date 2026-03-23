@@ -20,7 +20,7 @@ log = utils.get_logger("write_ledger")
 # 账本表头，与 README 字段定义一致
 LEDGER_HEADERS = [
     "time", "type", "amount", "source", "dest",
-    "note", "raw_input", "image_path", "processed_at",
+    "note", "image_path",
 ]
 
 
@@ -48,8 +48,7 @@ def _parse_entries(ai_result: str, row: dict) -> list[dict]:
     result = []
     for entry in entries:
         if "error" in entry:
-            log.warning(f"AI 标记无法识别: {entry['error']} — {row['image_path']}")
-            continue
+            raise ValueError(f"AI 标记无法识别: {entry['error']}")
         result.append({
             "time":         entry.get("date") or "",
             "type":         entry.get("type") or "",
@@ -57,9 +56,7 @@ def _parse_entries(ai_result: str, row: dict) -> list[dict]:
             "source":       entry.get("source") or "",
             "dest":         entry.get("dest") or "",
             "note":         entry.get("note") or "",
-            "raw_input":    row["ocr_text"],
             "image_path":   row["image_path"],
-            "processed_at": utils.now_str(),
         })
     return result
 
