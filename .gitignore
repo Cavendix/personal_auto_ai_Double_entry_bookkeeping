@@ -1,0 +1,10 @@
+
+failed/
+inbox/
+logs/
+processed/
+__pycache__/
+.env
+ledger.xlsx
+ocr_queue.csv
+ocr_done.csv
