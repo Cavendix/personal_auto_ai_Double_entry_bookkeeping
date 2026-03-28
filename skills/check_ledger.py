@@ -1,126 +1,148 @@
 """
-check_ledger.py — Skill: 复式记账检查
-根据 ledger.xlsx 中的支出和收入计算每个账户的变动，并与 OCR 提取的余额列对比。
-如发现不一致，则报告具体日期、行号及误差情况。
-"""
-import sys
-import openpyxl
-from pathlib import Path
-from dotenv import load_dotenv
+Skill 2: 复式账本对账
+按复式记账规则逐行还原各账户余额；统计资金总览；发现异常时报告，不修改账本。
 
-# 将上级目录加入 sys.path，以便导入 utils 模块
-sys.path.insert(0, str(Path(__file__).parent))
-import utils
+规则：
+- 支出 (Expense)：只扣减 source 账户（我的钱少了）
+- 收入 (Income)：只增加 dest 账户（我的钱多了）
+- 互转 (Transfer)：source 扣减，dest 增加
+"""
+import os
+import csv
+from pathlib import Path
+from collections import defaultdict
+from dotenv import load_dotenv
 
 load_dotenv()
 
-log = utils.get_logger("check_ledger")
+LEDGER_PATH = Path(os.getenv("LEDGER_PATH", "./ledger.csv"))
 
-def run() -> str:
+# 哪些账户名是「我的账户」（余额会随流水变动）
+MY_ACCOUNTS = {
+    "微信", "支付宝", "花呗",
+    "工商银行4674", "工商银行8642",
+    "中国银行9158", "中国银行9168", "中国银行数字人民币",
+    "邮储银行8533", "交通银行2162",
+    "天星银行储蓄账户", "中信银行2684",
+}
+
+
+def _is_my_account(name: str) -> bool:
+    if not name:
+        return False
+    name = name.strip()
+    # 精确匹配 或 包含关键词（处理"工商银行尾号4674"等写法）
+    if name in MY_ACCOUNTS:
+        return True
+    for acc in MY_ACCOUNTS:
+        if acc in name:
+            return True
+    return False
+
+
+def check_ledger() -> str:
     """
-    检查账本的自洽性。
-    逐行模拟交易并推算账本内各账户在当下的理论余额。
-    当遇到具有确切识别余额（balance列）的行时，与推算余额进行比对，
-    记录任何由于误差、漏记引起的余额不匹配，供使用者排查。
+    主入口：读取 ledger.csv，逐行模拟余额，与 balance 字段比对，输出报告。
     """
-    # 确认账本文件是否存在
-    if not utils.LEDGER_PATH.exists():
-        msg = "ledger.xlsx 不存在，无法进行检查。"
-        log.info(msg)
-        return msg
+    if not LEDGER_PATH.exists():
+        return f"❌ 账本文件不存在: {LEDGER_PATH.resolve()}"
 
-    # 读取表格记录（仅加载数据值）
-    wb = openpyxl.load_workbook(utils.LEDGER_PATH, data_only=True)
-    ws = wb.active
+    with open(LEDGER_PATH, encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
 
-    if ws.max_row <= 1:
-        msg = "ledger.xlsx 中没有数据行。"
-        log.info(msg)
-        return msg
+    if not rows:
+        return "📭 账本为空，无数据可核对。"
 
-    # 动态获取表头所在的列索引，解耦对于列位置的强依赖
-    headers = [str(cell.value).strip() if cell.value else "" for cell in ws[1]]
-    try:
-        time_idx = headers.index("time")
-        type_idx = headers.index("type")
-        amt_idx  = headers.index("amount")
-        src_idx  = headers.index("source")
-        dest_idx = headers.index("dest")
-        bal_idx  = headers.index("balance")
-    except ValueError as e:
-        msg = f"ledger.xlsx 表头缺失必需字段，检查失败: {e}"
-        log.error(msg)
-        return msg
+    # 累计余额：account -> float
+    balances: dict[str, float] = defaultdict(float)
+    anomalies: list[str] = []
+    TOLERANCE = 0.01  # 浮点误差容忍
 
-    computed_balances = {}       # 存放我们在代码推演中得出的每个账户余额
-    initialized_accounts = set() # 记录哪些账户已经用从表格获得的“初始真实余额”初始化了
-    errors = []                  # 收集发现的问题
+    for i, row in enumerate(rows, start=2):  # start=2 对应 CSV 数据行号（第1行是表头）
+        txn_time   = row.get("time", "").strip() or f"行{i}"
+        txn_type   = row.get("type", "").strip()
+        source     = row.get("source", "").strip()
+        dest       = row.get("dest", "").strip()
+        image_path = row.get("image_path", "")
 
-    # 从第 2 行（跳过表头）开始逐行扫描账本数据
-    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
-        row_time = row[time_idx] or ""
-        row_type = str(row[type_idx] or "").strip()
-        
-        # 解析金额，如果无法解析则视为 0
         try:
-            amount = float(row[amt_idx])
-        except (ValueError, TypeError):
-            amount = 0.0
+            amount = float(row.get("amount", 0) or 0)
+        except ValueError:
+            anomalies.append(f"⚠️  [{txn_time}] amount 字段非数字: {row.get('amount')}")
+            continue
 
-        source = str(row[src_idx] or "").strip()
-        dest = str(row[dest_idx] or "").strip()
-        file_balance_raw = row[bal_idx]
+        balance_raw = row.get("balance", "").strip()
+        has_balance = balance_raw not in ("", "None", "null", "NULL")
+        try:
+            snapshot_balance = float(balance_raw) if has_balance else None
+        except ValueError:
+            snapshot_balance = None
 
-        # 根据交易类型，更新相关账户的理论余额
-        if row_type == "支出" and source:
-            computed_balances[source] = computed_balances.get(source, 0.0) - amount
-        elif row_type == "收入" and dest:
-            computed_balances[dest] = computed_balances.get(dest, 0.0) + amount
-        elif row_type == "互转":
-            if source:
-                computed_balances[source] = computed_balances.get(source, 0.0) - amount
-            if dest:
-                computed_balances[dest] = computed_balances.get(dest, 0.0) + amount
+        # ===== 按类型更新余额 =====
+        if txn_type == "支出":
+            if _is_my_account(source):
+                balances[source] -= amount
+            # dest 是商家/消费品类，不参与余额计算
 
-        # 判断这笔交易之后，表格里的余额数据（如有）属于哪一方账户
-        target_account = ""
-        if row_type == "支出":
-            target_account = source
-        elif row_type in ["收入", "互转"]:
-            target_account = dest
+        elif txn_type == "收入":
+            if _is_my_account(dest):
+                balances[dest] += amount
+            # source 是付款方，不参与余额计算
+
+        elif txn_type == "互转":
+            if _is_my_account(source):
+                balances[source] -= amount
+            if _is_my_account(dest):
+                balances[dest] += amount
+
         else:
-            # 对于未知类型或无归属对象的，跳过检查
-            pass
-        
-        # 开始验证比对
-        if target_account and file_balance_raw is not None and str(file_balance_raw).strip() != "":
-            try:
-                # 尝试解析表中的核对余额
-                fb = float(file_balance_raw)
-                if target_account not in initialized_accounts:
-                    # 如果这是本账户第一次遇到带有余额的记录，
-                    # 那么以此作为起点基准值，赋给推算状态。
-                    computed_balances[target_account] = fb
-                    initialized_accounts.add(target_account)
-                else:
-                    cb = computed_balances[target_account]
-                    # 针对经过数学推算后的余额与表内的提取余额进行浮点差异对比（容差值 0.05 元）
-                    if abs(cb - fb) > 0.05:
-                        err_msg = (f"行 {row_idx} ({row_time}): 账户[{target_account}] 余额不符。 "
-                                   f"计算推算值: {cb:.2f}, 账本原值: {fb:.2f}")
-                        errors.append(err_msg)
-            except ValueError:
-                pass  # 表内的余额非合法浮点数字符串，跳过检查
+            anomalies.append(f"⚠️  [{txn_time}] 未知交易类型: '{txn_type}'（行{i}）")
+            continue
 
-    # 根据检查结果提供详细反馈
-    if errors:
-        msg = f"复式记账检查发现 {len(errors)} 个计算与现实值出入的错误:\n" + "\n".join(errors)
-        log.warning(msg)
-        return msg
+        # ===== 余额比对（仅互转时 balance 有意义，其余类型可选比对 source） =====
+        if snapshot_balance is not None:
+            # 互转时，balance 是 source 账户扣减后的余额
+            compare_account = source if txn_type in ("互转", "支出") else dest
+            if _is_my_account(compare_account):
+                calc = balances[compare_account]
+                diff = abs(calc - snapshot_balance)
+                if diff > TOLERANCE:
+                    anomalies.append(
+                        f"❌ [{txn_time}] {compare_account} 余额不符 "
+                        f"| 计算值: {calc:.2f}  截图值: {snapshot_balance:.2f}  "
+                        f"差额: {snapshot_balance - calc:+.2f}"
+                        f"  | 图片: {image_path}"
+                    )
+
+    # ===== 汇总报告 =====
+    lines = []
+    lines.append("=" * 55)
+    lines.append("📊 资金总览（基于流水累计计算）")
+    lines.append("=" * 55)
+
+    my_total = 0.0
+    for acc in sorted(balances.keys()):
+        bal = balances[acc]
+        is_mine = _is_my_account(acc)
+        tag = "💳" if is_mine else "🏪"
+        lines.append(f"  {tag} {acc:<20} ¥ {bal:>12,.2f}")
+        if is_mine:
+            my_total += bal
+
+    lines.append("-" * 55)
+    lines.append(f"  💰 我的账户总资产（估算）      ¥ {my_total:>12,.2f}")
+    lines.append("=" * 55)
+
+    if anomalies:
+        lines.append(f"\n⚠️  发现 {len(anomalies)} 处对账异常，请人工复查：\n")
+        lines.extend(anomalies)
     else:
-        msg = "复式记账检查通过，未发现余额异常。"
-        log.info(msg)
-        return msg
+        lines.append("\n✅ 账本余额核对一致，未发现异常。")
+
+    lines.append(f"\n📋 共核对 {len(rows)} 笔记录。")
+    return "\n".join(lines)
+
 
 if __name__ == "__main__":
-    print(run())
+    print(check_ledger())

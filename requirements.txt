@@ -1,8 +1,6 @@
 mcp[cli]
-watchdog
-requests
 openpyxl
 python-dotenv
 pyyaml
 Pillow
-google-generativeai
+google-genai
